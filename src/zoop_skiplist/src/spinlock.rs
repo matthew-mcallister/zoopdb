@@ -1,0 +1,100 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+pub(crate) const SPINLOCK_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// A simple spinlock with timeout for deadlock avoidance.
+///
+/// # Panics
+///
+/// Panics if the lock cannot be acquired within `SPINLOCK_TIMEOUT_NS`.
+pub(crate) struct SpinLock {
+    locked: AtomicBool,
+}
+
+impl Default for SpinLock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpinLock {
+    /// Creates a new unlocked spinlock.
+    pub(crate) const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    /// Acquires the lock, spinning until successful or timeout.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the lock cannot be acquired within `SPINLOCK_TIMEOUT_NS`.
+    pub(crate) fn lock(&self) -> SpinLockGuard<'_> {
+        let start = std::time::Instant::now();
+
+        loop {
+            // Try to acquire the lock
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return SpinLockGuard { lock: self };
+            }
+
+            // Spin with backoff
+            let mut spin_count = 0u32;
+            while self.locked.load(Ordering::Relaxed) {
+                spin_count += 1;
+
+                if spin_count % 64 == 0 {
+                    // Check timeout periodically
+                    if start.elapsed().as_nanos() as u64 > SPINLOCK_TIMEOUT_NS {
+                        panic!(
+                            "SpinLock timeout: could not acquire lock within {}ms. Possible deadlock.",
+                            SPINLOCK_TIMEOUT_NS / 1_000_000
+                        );
+                    }
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Tries to acquire the lock without blocking.
+    ///
+    /// Returns `Some(guard)` if the lock was acquired, `None` otherwise.
+    #[allow(dead_code)]
+    pub(crate) fn try_lock(&self) -> Option<SpinLockGuard<'_>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(SpinLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+
+    /// Releases the lock.
+    #[inline]
+    pub(crate) fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// RAII spinlock guard.
+pub(crate) struct SpinLockGuard<'a> {
+    lock: &'a SpinLock,
+}
+
+impl Drop for SpinLockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.unlock()
+    }
+}
