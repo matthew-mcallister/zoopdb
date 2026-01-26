@@ -171,7 +171,7 @@ impl<T> Node<T> {
         layout.pad_to_align()
     }
 
-    fn alloc<'a>(node: Self, pointers: &[*mut Node<T>]) -> *mut Self {
+    fn alloc(node: Self, pointers: &[*mut Node<T>]) -> *mut Self {
         let height = node.inner.height as usize;
         assert!(height >= 1 && height <= MAX_HEIGHT);
         assert_eq!(pointers.len(), height);
@@ -210,13 +210,19 @@ impl<T> Node<T> {
     }
 }
 
-/// A reference to an entry in the skiplist.
-pub struct Ref<'a, T: Ord> {
-    node: &'a Node<T>,
+/// A reference to an entry in a skiplist.
+pub struct Ref<T: 'static> {
+    node: &'static Node<T>,
     // TODO: Epoch guard
 }
 
-impl<'a, T: Ord> std::ops::Deref for Ref<'a, T> {
+impl<T: std::fmt::Debug> std::fmt::Debug for Ref<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", &self.node.element)
+    }
+}
+
+impl<T> std::ops::Deref for Ref<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -245,15 +251,15 @@ impl<'a, T: Ord> std::ops::Deref for Ref<'a, T> {
 /// assert!(!skiplist.contains(&1));
 /// ```
 // TODO: Comparator
-pub struct SkipList<T: Ord> {
+pub struct SkipList<T> {
     head: Head<T>,
     len: AtomicUsize,
 }
 
-unsafe impl<T: Ord + Send> Send for SkipList<T> {}
-unsafe impl<T: Ord + Send + Sync> Sync for SkipList<T> {}
+unsafe impl<T: Send> Send for SkipList<T> {}
+unsafe impl<T: Send + Sync> Sync for SkipList<T> {}
 
-impl<T: Ord> SkipList<T> {
+impl<T> SkipList<T> {
     /// Creates a new empty skiplist.
     pub fn new() -> Self {
         Self {
@@ -272,13 +278,15 @@ impl<T: Ord> SkipList<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
 
+impl<T: Ord + 'static> SkipList<T> {
     /// Searches for a element and returns a reference to its entry if found.
     ///
     /// It is possible for the returned element to be removed from the list
     /// after, or even before, this method returns. It is up to the caller to
     /// perform synchronization if desired to prevent this effect.
-    pub fn get<'a, Q>(&'a self, element: &Q) -> Option<Ref<'a, T>>
+    pub fn get<Q>(&self, element: &Q) -> Option<Ref<T>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -306,7 +314,7 @@ impl<T: Ord> SkipList<T> {
     ///
     /// Note that concurrent readers may not uniformly observe the newly
     /// inserted element unless external synchronization is imposed.
-    pub fn insert(&self, element: T) -> Ref<'_, T> where T: std::fmt::Debug {
+    pub fn insert(&self, element: T) -> Ref<T> {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
 
@@ -372,7 +380,7 @@ impl<T: Ord> SkipList<T> {
 
     /// Removes an entry by key, returning a reference to the existing entry
     /// if found.
-    pub fn remove<'a, Q>(&'a self, key: &Q) -> Option<Ref<'a, T>>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Ref<T>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -421,8 +429,8 @@ impl<T: Ord> SkipList<T> {
         &'a self,
         key: &Q,
         preds: &mut [&'a NodeMeta<T>; MAX_HEIGHT],
-        succs: &mut [Option<&'a Node<T>>; MAX_HEIGHT],
-    ) -> Option<&'a Node<T>>
+        succs: &mut [Option<&'static Node<T>>; MAX_HEIGHT],
+    ) -> Option<&'static Node<T>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -462,7 +470,7 @@ impl<T: Ord> SkipList<T> {
     /// Finds the node that matches the given key, if it exists. Unlike
     /// `find()`, does not construct predecessor/successor lists and terminates
     /// early when a matching node is found.
-    fn find_node<'a, Q>(&'a self, key: &Q) -> Option<&'a Node<T>>
+    fn find_node<Q>(&self, key: &Q) -> Option<&'static Node<T>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
@@ -490,13 +498,13 @@ impl<T: Ord> SkipList<T> {
         None
     }
 
-    fn iter_nodes(&self) -> impl Iterator<Item = &Node<T>> {
-        struct Iter<'a, T: Ord> {
-            current: Option<&'a Node<T>>,
+    fn iter_nodes(&self) -> impl Iterator<Item = &'static Node<T>> {
+        struct Iter<T: Ord + 'static> {
+            current: Option<&'static Node<T>>,
         }
 
-        impl<'a, T: Ord> Iterator for Iter<'a, T> {
-            type Item = &'a Node<T>;
+        impl<T: Ord + 'static> Iterator for Iter<T> {
+            type Item = &'static Node<T>;
 
             fn next(&mut self) -> Option<Self::Item> {
                 let curr = self.current?;
@@ -514,12 +522,12 @@ impl<T: Ord> SkipList<T> {
 
     /// Returns an iterator over the nodes of the list. Note that this iterator
     /// may iterate over deleted values if the element it points to is removed.
-    pub fn iter(&self) -> impl Iterator<Item = Ref<'_, T>> {
+    pub fn iter(&self) -> impl Iterator<Item = Ref<T>> {
         self.iter_nodes().map(|node| Ref { node })
     }
 }
 
-impl<T: Ord> Default for SkipList<T> {
+impl<T> Default for SkipList<T> {
     fn default() -> Self {
         Self::new()
     }
