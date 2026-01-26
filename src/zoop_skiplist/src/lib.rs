@@ -7,6 +7,7 @@
 //!
 //! Removed nodes are freed using epoch-based reclamation (WIP).
 
+pub mod comparison;
 mod ebr;
 mod rng;
 pub mod list;

@@ -1,11 +1,11 @@
 use std::alloc::Layout;
-use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering as AtomicOrdering};
 
 use rand::Rng;
 
+use crate::comparison::{BasicComparison, Comparison};
 use crate::rng::rng;
 use crate::spinlock::{SpinLock, SpinLockGuard};
 
@@ -89,6 +89,10 @@ fn as_ptr<T>(reference: Option<&T>) -> *const T {
 
 /// Locks all predecessors, handling reentrancy and aborting if any of the
 /// nodes were invalidated by concurrent mutation.
+// XXX: It would be possible to get rid of these locks by doing a
+// compare_exchange loop on each level of the pointer list. However, then it
+// becomes more difficult to deal with marked nodes. Maybe worth the tradeoff
+// if most/all inserts are unique keys.
 fn lock_all<'pr, T>(
     preds: &'pr [&NodeMeta<T>],
     succs: &[Option<&Node<T>>],
@@ -153,6 +157,7 @@ struct Node<T> {
 
 impl<T> Node<T> {
     const _ASSERT_LAYOUT: () = {
+        // Layout with 0 pointers should be equal
         let layout1 = Self::layout(0);
         let layout2 = Layout::new::<Self>();
         assert!(layout1.size() == layout2.size());
@@ -211,6 +216,7 @@ impl<T> Node<T> {
 }
 
 /// A reference to an entry in a skiplist.
+#[derive(Clone)]
 pub struct Ref<T: 'static> {
     node: &'static Node<T>,
     // TODO: Epoch guard
@@ -227,6 +233,14 @@ impl<T> std::ops::Deref for Ref<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.node.element
+    }
+}
+
+impl<T: 'static> Ref<T> {
+    /// Steps to the following node in the list, if there is one.
+    pub fn next(self) -> Option<Ref<T>> {
+        let node = unsafe { &*self.node.inner[0].load(AtomicOrdering::Relaxed) };
+        Some(Ref { node })
     }
 }
 
@@ -250,21 +264,39 @@ impl<T> std::ops::Deref for Ref<T> {
 /// skiplist.remove(&1);
 /// assert!(!skiplist.contains(&1));
 /// ```
-// TODO: Comparator
-pub struct SkipList<T> {
+pub struct SkipList<T, C = BasicComparison> {
     head: Head<T>,
     len: AtomicUsize,
+    comparison: C,
 }
 
-unsafe impl<T: Send> Send for SkipList<T> {}
-unsafe impl<T: Send + Sync> Sync for SkipList<T> {}
+unsafe impl<T: Send, C: Send + Sync> Send for SkipList<T, C> {}
+unsafe impl<T: Send + Sync, C: Send + Sync> Sync for SkipList<T, C> {}
 
-impl<T> SkipList<T> {
+impl<T: 'static> SkipList<T> {
     /// Creates a new empty skiplist.
     pub fn new() -> Self {
+        Default::default()
+    }
+}
+
+impl<T: 'static, C: Default> Default for SkipList<T, C> {
+    fn default() -> Self {
         Self {
             head: Default::default(),
             len: AtomicUsize::new(0),
+            comparison: Default::default(),
+        }
+    }
+}
+
+impl<T: 'static, C> SkipList<T, C> {
+    /// Creates a new empty skiplist with the given comparison function.
+    pub fn with_comparison(comparison: C) -> Self {
+        Self {
+            head: Default::default(),
+            len: AtomicUsize::new(0),
+            comparison,
         }
     }
 
@@ -278,9 +310,35 @@ impl<T> SkipList<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
 
-impl<T: Ord + 'static> SkipList<T> {
+    fn iter_nodes(&self) -> impl Iterator<Item = &'static Node<T>> {
+        struct Iter<T: 'static> {
+            current: Option<&'static Node<T>>,
+        }
+
+        impl<T: 'static> Iterator for Iter<T> {
+            type Item = &'static Node<T>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                let curr = self.current?;
+                let next_ptr = curr.inner[0].load(AtomicOrdering::Relaxed);
+                let next = unsafe { next_ptr.as_ref() };
+                self.current = next;
+                Some(curr)
+            }
+        }
+
+        let first_ptr = self.head.pointers[0].load(AtomicOrdering::Relaxed);
+        let first = unsafe { first_ptr.as_ref() };
+        Iter { current: first }
+    }
+
+    /// Returns an iterator over the nodes of the list. Note that this iterator
+    /// may iterate over deleted values if the element it points to is removed.
+    pub fn iter(&self) -> impl Iterator<Item = Ref<T>> {
+        self.iter_nodes().map(|node| Ref { node })
+    }
+
     /// Searches for a element and returns a reference to its entry if found.
     ///
     /// It is possible for the returned element to be removed from the list
@@ -288,8 +346,8 @@ impl<T: Ord + 'static> SkipList<T> {
     /// perform synchronization if desired to prevent this effect.
     pub fn get<Q>(&self, element: &Q) -> Option<Ref<T>>
     where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        C: Comparison<T, Q>,
     {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
@@ -299,12 +357,12 @@ impl<T: Ord + 'static> SkipList<T> {
     }
 
     /// Returns true if the skiplist contains the given element.
-    pub fn contains<Q>(&self, element: &T) -> bool
+    pub fn contains<Q>(&self, element: &Q) -> bool
     where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        C: Comparison<T, Q>,
     {
-        self.get(element.borrow()).is_some()
+        self.get(element).is_some()
     }
 
     /// Inserts a new element and returns a reference to it.
@@ -314,7 +372,10 @@ impl<T: Ord + 'static> SkipList<T> {
     ///
     /// Note that concurrent readers may not uniformly observe the newly
     /// inserted element unless external synchronization is imposed.
-    pub fn insert(&self, element: T) -> Ref<T> {
+    pub fn insert(&self, element: T) -> Ref<T>
+    where
+        C: Comparison<T>,
+    {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
 
@@ -382,8 +443,8 @@ impl<T: Ord + 'static> SkipList<T> {
     /// if found.
     pub fn remove<Q>(&self, key: &Q) -> Option<Ref<T>>
     where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        C: Comparison<T, Q>,
     {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
@@ -432,8 +493,8 @@ impl<T: Ord + 'static> SkipList<T> {
         succs: &mut [Option<&'static Node<T>>; MAX_HEIGHT],
     ) -> Option<&'static Node<T>>
     where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        C: Comparison<T, Q>,
     {
         let mut existing = None;
 
@@ -445,8 +506,8 @@ impl<T: Ord + 'static> SkipList<T> {
 
             // Traverse forward while curr < key
             while let Some(curr) = curr_opt {
-                match key.cmp(curr.element.borrow()) {
-                    Ordering::Greater => {
+                match self.comparison.cmp(&curr.element, key) {
+                    Ordering::Less => {
                         pred = &curr.inner;
                         curr_opt = unsafe { curr.inner[level].load(AtomicOrdering::Relaxed).as_ref() };
                     }
@@ -454,7 +515,7 @@ impl<T: Ord + 'static> SkipList<T> {
                         existing = Some(curr);
                         break;
                     }
-                    Ordering::Less => {
+                    Ordering::Greater => {
                         break;
                     }
                 }
@@ -472,8 +533,8 @@ impl<T: Ord + 'static> SkipList<T> {
     /// early when a matching node is found.
     fn find_node<Q>(&self, key: &Q) -> Option<&'static Node<T>>
     where
-        T: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: ?Sized,
+        C: Comparison<T, Q>,
     {
         let mut pred: &NodeMeta<T> = self.head.as_ref();
         for level in (0..MAX_HEIGHT).rev() {
@@ -481,55 +542,21 @@ impl<T: Ord + 'static> SkipList<T> {
                 pred[level].load(AtomicOrdering::Relaxed).as_ref()
             };
             while let Some(curr) = curr_opt {
-                match key.cmp(curr.element.borrow()) {
-                    Ordering::Greater => {
+                match self.comparison.cmp(&curr.element, key) {
+                    Ordering::Less => {
                         pred = &curr.inner;
                         curr_opt = unsafe { curr.inner[level].load(AtomicOrdering::Relaxed).as_ref() };
                     }
                     Ordering::Equal => {
                         return Some(curr)
                     }
-                    Ordering::Less => {
+                    Ordering::Greater => {
                         break;
                     }
                 }
             }
         }
         None
-    }
-
-    fn iter_nodes(&self) -> impl Iterator<Item = &'static Node<T>> {
-        struct Iter<T: Ord + 'static> {
-            current: Option<&'static Node<T>>,
-        }
-
-        impl<T: Ord + 'static> Iterator for Iter<T> {
-            type Item = &'static Node<T>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                let curr = self.current?;
-                let next_ptr = curr.inner[0].load(AtomicOrdering::Relaxed);
-                let next = unsafe { next_ptr.as_ref() };
-                self.current = next;
-                Some(curr)
-            }
-        }
-
-        let first_ptr = self.head.pointers[0].load(AtomicOrdering::Relaxed);
-        let first = unsafe { first_ptr.as_ref() };
-        Iter { current: first }
-    }
-
-    /// Returns an iterator over the nodes of the list. Note that this iterator
-    /// may iterate over deleted values if the element it points to is removed.
-    pub fn iter(&self) -> impl Iterator<Item = Ref<T>> {
-        self.iter_nodes().map(|node| Ref { node })
-    }
-}
-
-impl<T> Default for SkipList<T> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
