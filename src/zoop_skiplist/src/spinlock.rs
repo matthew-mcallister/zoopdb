@@ -1,13 +1,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-pub(crate) const SPINLOCK_TIMEOUT_NS: u64 = 1_000_000_000;
-
 /// A simple spinlock with timeout for deadlock avoidance.
-///
-/// # Panics
-///
-/// Panics if the lock cannot be acquired within `SPINLOCK_TIMEOUT_NS`.
 pub(crate) struct SpinLock {
     locked: AtomicBool,
 }
@@ -27,13 +21,7 @@ impl SpinLock {
     }
 
     /// Acquires the lock, spinning until successful or timeout.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the lock cannot be acquired within `SPINLOCK_TIMEOUT_NS`.
     pub(crate) fn lock(&self) -> SpinLockGuard<'_> {
-        let start = std::time::Instant::now();
-
         loop {
             // Try to acquire the lock
             if self
@@ -44,19 +32,12 @@ impl SpinLock {
                 return SpinLockGuard { lock: self };
             }
 
-            // Spin with backoff
             let mut spin_count = 0u32;
             while self.locked.load(Ordering::Relaxed) {
                 spin_count += 1;
 
                 if spin_count % 64 == 0 {
-                    // Check timeout periodically
-                    if start.elapsed().as_nanos() as u64 > SPINLOCK_TIMEOUT_NS {
-                        panic!(
-                            "SpinLock timeout: could not acquire lock within {}ms. Possible deadlock.",
-                            SPINLOCK_TIMEOUT_NS / 1_000_000
-                        );
-                    }
+                    // Yield periodically
                     std::thread::yield_now();
                 } else {
                     std::hint::spin_loop();
@@ -79,6 +60,10 @@ impl SpinLock {
         } else {
             None
         }
+    }
+
+    pub(crate) fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
     }
 
     /// Releases the lock.

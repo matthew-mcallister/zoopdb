@@ -12,4 +12,4 @@ mod rng;
 mod skiplist;
 mod spinlock;
 
-pub use skiplist::{ConcurrentSkipList, Ref};
+pub use skiplist::{SkipList, Ref};

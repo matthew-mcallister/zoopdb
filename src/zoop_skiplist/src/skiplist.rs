@@ -70,7 +70,13 @@ impl<T> NodeMeta<T> {
     }
 
     fn mark(&self) {
+        debug_assert!(self.lock.is_locked());
         self.marked.store(true, AtomicOrdering::Relaxed)
+    }
+
+    fn link(&self, level: usize, target: *mut Node<T>) {
+        debug_assert!(self.lock.is_locked());
+        self[level].store(target, AtomicOrdering::Relaxed);
     }
 }
 
@@ -103,7 +109,7 @@ fn lock_all<'pr, T>(
         }
 
         let s = pred[level].load(AtomicOrdering::Relaxed);
-        if !pred.is_marked() && s as *const _ != as_ptr(succs[level]) {
+        if pred.is_marked() || s as *const _ != as_ptr(succs[level]) {
             // Predecessor was mutated, need to refresh lists
             return None;
         }
@@ -238,9 +244,9 @@ impl<'a, T: Ord> std::ops::Deref for Ref<'a, T> {
 /// skiplist.remove(&1);
 /// assert!(!skiplist.contains(&1));
 /// ```
+// TODO: Comparator
 pub struct SkipList<T: Ord> {
     head: Head<T>,
-    /// Approximate number of elements in the list
     len: AtomicUsize,
 }
 
@@ -256,7 +262,8 @@ impl<T: Ord> SkipList<T> {
         }
     }
 
-    /// Returns the approximate number of elements in the skiplist.
+    /// Returns the approximate number of elements in the skiplist. This is
+    /// exact if there are no concurrent writers.
     pub fn len(&self) -> usize {
         self.len.load(AtomicOrdering::Relaxed)
     }
@@ -308,8 +315,7 @@ impl<T: Ord> SkipList<T> {
 
         let (height, existing, _guards) = loop {
             // Find insertion point
-            let level = self.find(&element, &mut preds, &mut succs);
-            let existing = if level != -1 { succs[level as usize] } else { None };
+            let existing = self.find(&element, &mut preds, &mut succs);
 
             // New height must be >= old height or else pointers to old node will persist
             let height = if let Some(e) = existing { e.inner.height as usize } else { random_height() };
@@ -318,7 +324,15 @@ impl<T: Ord> SkipList<T> {
             let Some(guards) = lock_all(&preds[..height], &succs[..height]) else { continue };
             break (height, existing, guards);
         };
+        let _guard = if let Some(existing) = existing {
+            let guard = existing.inner.lock.lock();
+            debug_assert!(!existing.inner.is_marked(), "node not fully unlinked");
+            Some(guard)
+        } else {
+            None
+        };
 
+        // Build new node
         let node = Node {
             element,
             inner: NodeMeta {
@@ -328,7 +342,6 @@ impl<T: Ord> SkipList<T> {
                 pointers: Default::default(),
             },
         };
-
         let mut pointers: Vec<*mut Node<T>> = (0..height)
             .map(|_| Default::default())
             .collect();
@@ -341,11 +354,11 @@ impl<T: Ord> SkipList<T> {
             }
         }
 
+        // Allocate and link new node
         let node_ptr = Node::alloc(node, &pointers);
         let node = unsafe { &*node_ptr };
-
         for level in (0..height).rev() {
-            preds[level][level].store(node_ptr, AtomicOrdering::Relaxed);
+            preds[level].link(level, node_ptr);
         }
 
         if let Some(existing) = existing {
@@ -371,26 +384,23 @@ impl<T: Ord> SkipList<T> {
         let mut succs: [Option<&Node<T>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
 
         let (node, _guards) = loop {
-            let level = self.find(&key, &mut preds, &mut succs);
-            if level == -1 { return None; }
-
-            let node = succs[level as usize].unwrap();
+            let node = self.find(&key, &mut preds, &mut succs)?;
             if node.inner.is_marked() {
                 return None;
             }
 
-            let Some(guards) = lock_all(&preds, &succs) else { continue };
+            let height = node.inner.height as usize;
+            let Some(guards) = lock_all(&preds[..height], &succs[..height]) else { continue };
             break (node, guards);
         };
+        let _guard = node.inner.lock.lock();
 
-        if node.inner.is_marked() {
-            return None;
-        }
+        debug_assert!(!node.inner.is_marked(), "node not fully unlinked");
 
-        // Update predecessor pointers
+        // Update pointers of predecessors
         for level in (0..node.inner.height as usize).rev() {
             let p = node.inner[level].load(AtomicOrdering::Relaxed);
-            preds[level][level].store(p, AtomicOrdering::Relaxed);
+            preds[level].link(level, p);
         }
 
         node.inner.mark();
@@ -405,18 +415,19 @@ impl<T: Ord> SkipList<T> {
     /// - `succs[0]` points to the smallest element greater than or equal
     ///   to the key
     ///
-    /// Returns the level at which the key was found, or -1 if not found.
+    /// If a node already exists with a matching key, returns a reference to
+    /// that node.
     fn find<'a, Q>(
         &'a self,
         key: &Q,
         preds: &mut [&'a NodeMeta<T>; MAX_HEIGHT],
         succs: &mut [Option<&'a Node<T>>; MAX_HEIGHT],
-    ) -> i32
+    ) -> Option<&'a Node<T>>
     where
         T: Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut found_level: i32 = -1;
+        let mut existing = None;
 
         let mut pred: &NodeMeta<T> = self.head.as_ref();
         for level in (0..MAX_HEIGHT).rev() {
@@ -432,9 +443,7 @@ impl<T: Ord> SkipList<T> {
                         curr_opt = unsafe { curr.inner[level].load(AtomicOrdering::Relaxed).as_ref() };
                     }
                     Ordering::Equal => {
-                        if found_level == -1 {
-                            found_level = level as i32;
-                        }
+                        existing = Some(curr);
                         break;
                     }
                     Ordering::Less => {
@@ -447,10 +456,12 @@ impl<T: Ord> SkipList<T> {
             succs[level] = curr_opt;
         }
 
-        found_level
+        existing
     }
 
-    /// Finds the node that matches the given key, if it exists.
+    /// Finds the node that matches the given key, if it exists. Unlike
+    /// `find()`, does not construct predecessor/successor lists and terminates
+    /// early when a matching node is found.
     fn find_node<'a, Q>(&'a self, key: &Q) -> Option<&'a Node<T>>
     where
         T: Borrow<Q>,
@@ -501,6 +512,8 @@ impl<T: Ord> SkipList<T> {
         Iter { current: first }
     }
 
+    /// Returns an iterator over the nodes of the list. Note that this iterator
+    /// may iterate over deleted values if the element it points to is removed.
     pub fn iter(&self) -> impl Iterator<Item = Ref<'_, T>> {
         self.iter_nodes().map(|node| Ref { node })
     }
@@ -514,6 +527,8 @@ impl<T: Ord> Default for SkipList<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     #[test]
@@ -572,6 +587,7 @@ mod tests {
             let skiplist_elems: Vec<i32> = skiplist.iter().map(|r| *r).collect();
             let btree_elems: Vec<i32> = btree.iter().cloned().collect();
             assert_eq!(skiplist_elems, btree_elems);
+            assert_eq!(skiplist.len(), skiplist_elems.len());
         }
     }
 
@@ -614,5 +630,76 @@ mod tests {
         assert_eq!(skiplist.get(&1).unwrap().1, 10);
         skiplist.insert(Pair(1, 20));
         assert_eq!(skiplist.get(&1).unwrap().1, 20);
+    }
+
+    #[test]
+    fn test_concurrent_insert() {
+        // Insert numbers from 0 to 7999 split across 8 threads.
+        let skiplist = Arc::new(SkipList::new());
+        let n_threads = 8;
+        let n_items = 1000;
+        let barrier = Arc::new(Barrier::new(n_threads));
+
+        let mut handles = Vec::new();
+        for i in 0..n_threads {
+            let skiplist = skiplist.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let start = i * n_items;
+                for j in 0..n_items {
+                    skiplist.insert(start + j);
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(skiplist.len(), n_threads * n_items);
+        for i in 0..n_threads * n_items {
+            assert!(skiplist.contains(&i), "Missing key {}", i);
+        }
+    }
+
+    #[test]
+    fn test_concurrent_insert_remove() {
+        let skiplist = Arc::new(SkipList::new());
+        let n_threads = 8;
+        let n_ops = 2000;
+
+        let barrier = Arc::new(Barrier::new(n_threads));
+        let mut handles = Vec::new();
+        for _ in 0..n_threads {
+            let skiplist = skiplist.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut rng = rand::rng();
+                for _ in 0..n_ops {
+                    let key = rng.random_range(0..100);
+                    if rng.random_bool(0.5) {
+                        skiplist.insert(key);
+                    } else {
+                        skiplist.remove(&key);
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let elems: Vec<u32> = skiplist.iter().map(|r| *r).collect();
+        // Elems has the correct len
+        assert_eq!(skiplist.len(), elems.len());
+        // Elems is ordered
+        for w in elems.windows(2) {
+            assert!(w[0] <= w[1]);
+        }
+        // Each elem is < 100
+        assert!(elems.last().map_or(true, |&n| n < 100));
     }
 }
