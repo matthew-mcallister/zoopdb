@@ -9,7 +9,7 @@
 
 mod ebr;
 mod rng;
-mod skiplist;
+pub mod list;
 mod spinlock;
 
-pub use skiplist::{SkipList, Ref};
+pub use crate::list::SkipList;
