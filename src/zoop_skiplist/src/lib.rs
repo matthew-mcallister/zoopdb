@@ -9,8 +9,8 @@
 
 pub mod comparison;
 mod ebr;
-mod rng;
 pub mod list;
+mod rng;
 mod spinlock;
 
 pub use crate::list::SkipList;

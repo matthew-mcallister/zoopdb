@@ -36,12 +36,12 @@ pub trait HashKey<T: ?Sized>: Equivalence<T> {
     fn hash<H: Hasher>(&self, state: &mut H, obj: &T);
 }
 
-/// A trivial comparison function that uses the standard library `Eq`, `Ord`,
-/// `Hash`, and `Borrow` traits to do comparisons/hashing.
+/// A canonical comparison function that uses the standard library traits `Eq`,
+/// `Ord`, `Hash`, and `Borrow` traits to do its comparisons/hashing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct BasicComparison;
+pub struct StdComparisonn;
 
-impl<L, R> Equivalence<L, R> for BasicComparison
+impl<L, R> Equivalence<L, R> for StdComparisonn
 where
     L: ?Sized + Borrow<R>,
     R: ?Sized + Eq,
@@ -51,7 +51,7 @@ where
     }
 }
 
-impl<L, R> Comparison<L, R> for BasicComparison
+impl<L, R> Comparison<L, R> for StdComparisonn
 where
     L: ?Sized + Borrow<R>,
     R: ?Sized + Ord,
@@ -61,7 +61,7 @@ where
     }
 }
 
-impl<T> HashKey<T> for BasicComparison
+impl<T> HashKey<T> for StdComparisonn
 where
     T: ?Sized + Eq + Hash,
 {

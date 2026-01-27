@@ -1,11 +1,12 @@
 use std::alloc::Layout;
 use std::cmp::Ordering;
+use std::fmt::Debug;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering as AtomicOrdering};
 
 use rand::Rng;
 
-use crate::comparison::{BasicComparison, Comparison};
+use crate::comparison::{StdComparisonn, Comparison};
 use crate::rng::rng;
 use crate::spinlock::{SpinLock, SpinLockGuard};
 
@@ -39,17 +40,17 @@ impl<T> Trailing<T> {
 /// All node data except for the key/value.
 // repr(C) since the successor list must be at the end
 #[repr(C)]
-struct NodeMeta<T> {
+struct NodeMeta<K, V> {
     lock: SpinLock,
     /// Marked as removed from list; will be collected after epoch ends. No
     /// live node ever points to a marked node.
     marked: AtomicBool,
     height: u8,
-    pointers: Trailing<AtomicPtr<Node<T>>>,
+    pointers: Trailing<AtomicPtr<Node<K, V>>>,
 }
 
-impl<T> std::ops::Index<usize> for NodeMeta<T> {
-    type Output = AtomicPtr<Node<T>>;
+impl<K, V> std::ops::Index<usize> for NodeMeta<K, V> {
+    type Output = AtomicPtr<Node<K, V>>;
 
     fn index(&self, index: usize) -> &Self::Output {
         assert!(index < self.height as usize);
@@ -57,14 +58,14 @@ impl<T> std::ops::Index<usize> for NodeMeta<T> {
     }
 }
 
-impl<T> std::ops::IndexMut<usize> for NodeMeta<T> {
+impl<K, V> std::ops::IndexMut<usize> for NodeMeta<K, V> {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         assert!(index < self.height as usize);
         unsafe { self.pointers.get_mut(index) }
     }
 }
 
-impl<T> NodeMeta<T> {
+impl<K, V> NodeMeta<K, V> {
     fn is_marked(&self) -> bool {
         self.marked.load(AtomicOrdering::Relaxed)
     }
@@ -74,7 +75,7 @@ impl<T> NodeMeta<T> {
         self.marked.store(true, AtomicOrdering::Relaxed)
     }
 
-    fn link(&self, level: usize, target: *mut Node<T>) {
+    fn link(&self, level: usize, target: *mut Node<K, V>) {
         debug_assert!(self.lock.is_locked());
         self[level].store(target, AtomicOrdering::Relaxed);
     }
@@ -93,9 +94,9 @@ fn as_ptr<T>(reference: Option<&T>) -> *const T {
 // compare_exchange loop on each level of the pointer list. However, then it
 // becomes more difficult to deal with marked nodes. Maybe worth the tradeoff
 // if most/all inserts are unique keys.
-fn lock_all<'pr, T>(
-    preds: &'pr [&NodeMeta<T>],
-    succs: &[Option<&Node<T>>],
+fn lock_all<'pr, K, V>(
+    preds: &'pr [&NodeMeta<K, V>],
+    succs: &[Option<&Node<K, V>>],
 ) -> Option<[Option<SpinLockGuard<'pr>>; MAX_HEIGHT]> {
     debug_assert_eq!(preds.len(), succs.len());
     let height = preds.len();
@@ -124,14 +125,14 @@ fn lock_all<'pr, T>(
 
 // Fixed-size pointer list
 #[repr(C)]
-struct Head<T> {
+struct Head<K, V> {
     lock: SpinLock,
     marked: AtomicBool,
     height: u8,
-    pointers: [AtomicPtr<Node<T>>; MAX_HEIGHT],
+    pointers: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
 }
 
-impl<T> Default for Head<T> {
+impl<K, V> Default for Head<K, V> {
     fn default() -> Self {
         Self {
             lock: Default::default(),
@@ -142,20 +143,22 @@ impl<T> Default for Head<T> {
     }
 }
 
-impl<T> AsRef<NodeMeta<T>> for Head<T> {
-    fn as_ref(&self) -> &NodeMeta<T> {
-        unsafe { &*(self as *const Self as *const NodeMeta<T>) }
+impl<K, V> AsRef<NodeMeta<K, V>> for Head<K, V> {
+    fn as_ref(&self) -> &NodeMeta<K, V> {
+        unsafe { &*(self as *const Self as *const NodeMeta<K, V>) }
     }
 }
 
 /// A node in the skiplist, with element data.
+// XXX: Pad this to a cache line?
 #[repr(C)]
-struct Node<T> {
-    element: T,
-    inner: NodeMeta<T>,
+struct Node<K, V> {
+    // Storing as (K, V) enables tighter layout under repr(C)
+    kv: (K, V),
+    inner: NodeMeta<K, V>,
 }
 
-impl<T> Node<T> {
+impl<K, V> Node<K, V> {
     const _ASSERT_LAYOUT: () = {
         // Layout with 0 pointers should be equal
         let layout1 = Self::layout(0);
@@ -165,18 +168,18 @@ impl<T> Node<T> {
     };
 
     const fn layout(height: usize) -> Layout {
-        let elem = Layout::new::<T>();
+        let elem = Layout::new::<(K, V)>();
 
-        // Compute the layout as if NodeMeta contained a field of type [AtomicPtr<T>; height]
-        let inner = Layout::new::<NodeMeta<T>>();
-        let Ok(array) = Layout::array::<AtomicPtr<Node<T>>>(height) else { panic!() };
+        // Compute the layout as if NodeMeta contained a field of type [AtomicPtr<K, V>; height]
+        let inner = Layout::new::<NodeMeta<K, V>>();
+        let Ok(array) = Layout::array::<AtomicPtr<Node<K, V>>>(height) else { panic!() };
         let Ok((inner, _)) = inner.extend(array) else { panic!() };
 
         let Ok((layout, _)) = elem.extend(inner) else { panic!() };
         layout.pad_to_align()
     }
 
-    fn alloc(node: Self, pointers: &[*mut Node<T>]) -> *mut Self {
+    fn alloc(node: Self, pointers: &[*mut Node<K, V>]) -> *mut Self {
         let height = node.inner.height as usize;
         assert!(height >= 1 && height <= MAX_HEIGHT);
         assert_eq!(pointers.len(), height);
@@ -217,28 +220,28 @@ impl<T> Node<T> {
 
 /// A reference to an entry in a skiplist.
 #[derive(Clone)]
-pub struct Ref<T: 'static> {
-    node: &'static Node<T>,
+pub struct Ref<K: 'static, V: 'static> {
+    node: &'static Node<K, V>,
     // TODO: Epoch guard
 }
 
-impl<T: std::fmt::Debug> std::fmt::Debug for Ref<T> {
+impl<K: Debug, V: Debug> std::fmt::Debug for Ref<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", &self.node.element)
+        f.debug_tuple("Ref").field(&self.node.kv.0).field(&self.node.kv.1).finish()
     }
 }
 
-impl<T> std::ops::Deref for Ref<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.node.element
+impl<K: 'static, V: 'static> Ref<K, V> {
+    pub fn key(&self) -> &K {
+        &self.node.kv.0
     }
-}
 
-impl<T: 'static> Ref<T> {
-    /// Steps to the following node in the list, if there is one.
-    pub fn next(self) -> Option<Ref<T>> {
+    pub fn value(&self) -> &V {
+        &self.node.kv.1
+    }
+
+    /// Advances to the following node in the list, if there is one.
+    pub fn next(self) -> Option<Ref<K, V>> {
         let node = unsafe { &*self.node.inner[0].load(AtomicOrdering::Relaxed) };
         Some(Ref { node })
     }
@@ -252,35 +255,40 @@ impl<T: 'static> Ref<T> {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
+/// use zoop_skiplist::SkipList;
+///
 /// let skiplist = SkipList::new();
-/// skiplist.insert(1);
-/// skiplist.insert(2);
+/// skiplist.insert(1, "red".to_owned());
+/// skiplist.insert(2, "blue".to_owned());
 ///
 /// assert!(skiplist.contains(&1));
-/// assert!(skiplist.contains(&2));
+/// assert_eq!(skiplist.get(&1).unwrap().value(), "red");
+/// assert_eq!(skiplist.get(&2).unwrap().value(), "blue");
 /// assert!(!skiplist.contains(&3));
 ///
 /// skiplist.remove(&1);
 /// assert!(!skiplist.contains(&1));
 /// ```
-pub struct SkipList<T, C = BasicComparison> {
-    head: Head<T>,
+pub struct SkipList<K, V, C = StdComparisonn> {
+    head: Head<K, V>,
     len: AtomicUsize,
     comparison: C,
 }
 
-unsafe impl<T: Send, C: Send + Sync> Send for SkipList<T, C> {}
-unsafe impl<T: Send + Sync, C: Send + Sync> Sync for SkipList<T, C> {}
+// Since you can get 'static references to K, V out of a SkipList, SkipList is
+// neither Send nor Sync unless K and V are Sync.
+unsafe impl<K: Send + Sync, V: Send + Sync, C: Send> Send for SkipList<K, V, C> {}
+unsafe impl<K: Send + Sync, V: Send + Sync, C: Send + Sync> Sync for SkipList<K, V, C> {}
 
-impl<T: 'static> SkipList<T> {
+impl<K, V> SkipList<K, V> {
     /// Creates a new empty skiplist.
     pub fn new() -> Self {
         Default::default()
     }
 }
 
-impl<T: 'static, C: Default> Default for SkipList<T, C> {
+impl<K, V, C: Default> Default for SkipList<K, V, C> {
     fn default() -> Self {
         Self {
             head: Default::default(),
@@ -290,7 +298,7 @@ impl<T: 'static, C: Default> Default for SkipList<T, C> {
     }
 }
 
-impl<T: 'static, C> SkipList<T, C> {
+impl<K: 'static, V: 'static, C> SkipList<K, V, C> {
     /// Creates a new empty skiplist with the given comparison function.
     pub fn with_comparison(comparison: C) -> Self {
         Self {
@@ -311,13 +319,13 @@ impl<T: 'static, C> SkipList<T, C> {
         self.len() == 0
     }
 
-    fn iter_nodes(&self) -> impl Iterator<Item = &'static Node<T>> {
-        struct Iter<T: 'static> {
-            current: Option<&'static Node<T>>,
+    fn iter_nodes(&self) -> impl Iterator<Item = &'static Node<K, V>> {
+        struct Iter<K: 'static, V: 'static> {
+            current: Option<&'static Node<K, V>>,
         }
 
-        impl<T: 'static> Iterator for Iter<T> {
-            type Item = &'static Node<T>;
+        impl<K: 'static, V: 'static> Iterator for Iter<K, V> {
+            type Item = &'static Node<K, V>;
 
             fn next(&mut self) -> Option<Self::Item> {
                 let curr = self.current?;
@@ -335,7 +343,7 @@ impl<T: 'static, C> SkipList<T, C> {
 
     /// Returns an iterator over the nodes of the list. Note that this iterator
     /// may iterate over deleted values if the element it points to is removed.
-    pub fn iter(&self) -> impl Iterator<Item = Ref<T>> {
+    pub fn iter(&self) -> impl Iterator<Item = Ref<K, V>> {
         self.iter_nodes().map(|node| Ref { node })
     }
 
@@ -344,10 +352,10 @@ impl<T: 'static, C> SkipList<T, C> {
     /// It is possible for the returned element to be removed from the list
     /// after, or even before, this method returns. It is up to the caller to
     /// perform synchronization if desired to prevent this effect.
-    pub fn get<Q>(&self, element: &Q) -> Option<Ref<T>>
+    pub fn get<Q>(&self, element: &Q) -> Option<Ref<K, V>>
     where
         Q: ?Sized,
-        C: Comparison<T, Q>,
+        C: Comparison<K, Q>,
     {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
@@ -360,31 +368,31 @@ impl<T: 'static, C> SkipList<T, C> {
     pub fn contains<Q>(&self, element: &Q) -> bool
     where
         Q: ?Sized,
-        C: Comparison<T, Q>,
+        C: Comparison<K, Q>,
     {
         self.get(element).is_some()
     }
 
-    /// Inserts a new element and returns a reference to it.
+    /// Inserts a new entry and returns a reference to it.
     ///
-    /// If the list already contains an existing element that compares equal to
-    /// the new element, the old element will be replaced.
+    /// If the list already contains an existing key that compares equal to
+    /// the new key, the old entry will be replaced.
     ///
     /// Note that concurrent readers may not uniformly observe the newly
-    /// inserted element unless external synchronization is imposed.
-    pub fn insert(&self, element: T) -> Ref<T>
+    /// inserted entry unless external synchronization is imposed.
+    pub fn insert(&self, key: K, value: V) -> Ref<K, V>
     where
-        C: Comparison<T>,
+        C: Comparison<K>,
     {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
 
-        let mut preds: [&NodeMeta<T>; MAX_HEIGHT] = [self.head.as_ref(); MAX_HEIGHT];
-        let mut succs: [Option<&Node<T>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
+        let mut preds: [&NodeMeta<K, V>; MAX_HEIGHT] = [self.head.as_ref(); MAX_HEIGHT];
+        let mut succs: [Option<&Node<K, V>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
 
         let (height, existing, _guards) = loop {
             // Find insertion point
-            let existing = self.find(&element, &mut preds, &mut succs);
+            let existing = self.find(&key, &mut preds, &mut succs);
 
             // New height must be >= old height or else pointers to old node will persist
             let height = if let Some(e) = existing { e.inner.height as usize } else { random_height() };
@@ -403,7 +411,7 @@ impl<T: 'static, C> SkipList<T, C> {
 
         // Build new node
         let node = Node {
-            element,
+            kv: (key, value),
             inner: NodeMeta {
                 height: height as _,
                 marked: AtomicBool::new(false),
@@ -411,7 +419,7 @@ impl<T: 'static, C> SkipList<T, C> {
                 pointers: Default::default(),
             },
         };
-        let mut pointers: Vec<*mut Node<T>> = (0..height)
+        let mut pointers: Vec<*mut Node<K, V>> = (0..height)
             .map(|_| Default::default())
             .collect();
         for level in (0..height).rev() {
@@ -441,16 +449,16 @@ impl<T: 'static, C> SkipList<T, C> {
 
     /// Removes an entry by key, returning a reference to the existing entry
     /// if found.
-    pub fn remove<Q>(&self, key: &Q) -> Option<Ref<T>>
+    pub fn remove<Q>(&self, key: &Q) -> Option<Ref<K, V>>
     where
         Q: ?Sized,
-        C: Comparison<T, Q>,
+        C: Comparison<K, Q>,
     {
         // TODO: Pin epoch here when EBR is implemented
         // let _guard = self.epoch.pin();
 
-        let mut preds: [&NodeMeta<T>; MAX_HEIGHT] = [self.head.as_ref(); MAX_HEIGHT];
-        let mut succs: [Option<&Node<T>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
+        let mut preds: [&NodeMeta<K, V>; MAX_HEIGHT] = [self.head.as_ref(); MAX_HEIGHT];
+        let mut succs: [Option<&Node<K, V>>; MAX_HEIGHT] = [None; MAX_HEIGHT];
 
         let (node, _guards) = loop {
             let node = self.find(&key, &mut preds, &mut succs)?;
@@ -489,16 +497,16 @@ impl<T: 'static, C> SkipList<T, C> {
     fn find<'a, Q>(
         &'a self,
         key: &Q,
-        preds: &mut [&'a NodeMeta<T>; MAX_HEIGHT],
-        succs: &mut [Option<&'static Node<T>>; MAX_HEIGHT],
-    ) -> Option<&'static Node<T>>
+        preds: &mut [&'a NodeMeta<K, V>; MAX_HEIGHT],
+        succs: &mut [Option<&'static Node<K, V>>; MAX_HEIGHT],
+    ) -> Option<&'static Node<K, V>>
     where
         Q: ?Sized,
-        C: Comparison<T, Q>,
+        C: Comparison<K, Q>,
     {
         let mut existing = None;
 
-        let mut pred: &NodeMeta<T> = self.head.as_ref();
+        let mut pred: &NodeMeta<K, V> = self.head.as_ref();
         for level in (0..MAX_HEIGHT).rev() {
             let mut curr_opt = unsafe {
                 pred[level].load(AtomicOrdering::Relaxed).as_ref()
@@ -506,7 +514,7 @@ impl<T: 'static, C> SkipList<T, C> {
 
             // Traverse forward while curr < key
             while let Some(curr) = curr_opt {
-                match self.comparison.cmp(&curr.element, key) {
+                match self.comparison.cmp(&curr.kv.0, key) {
                     Ordering::Less => {
                         pred = &curr.inner;
                         curr_opt = unsafe { curr.inner[level].load(AtomicOrdering::Relaxed).as_ref() };
@@ -531,18 +539,18 @@ impl<T: 'static, C> SkipList<T, C> {
     /// Finds the node that matches the given key, if it exists. Unlike
     /// `find()`, does not construct predecessor/successor lists and terminates
     /// early when a matching node is found.
-    fn find_node<Q>(&self, key: &Q) -> Option<&'static Node<T>>
+    fn find_node<Q>(&self, key: &Q) -> Option<&'static Node<K, V>>
     where
         Q: ?Sized,
-        C: Comparison<T, Q>,
+        C: Comparison<K, Q>,
     {
-        let mut pred: &NodeMeta<T> = self.head.as_ref();
+        let mut pred: &NodeMeta<K, V> = self.head.as_ref();
         for level in (0..MAX_HEIGHT).rev() {
             let mut curr_opt = unsafe {
                 pred[level].load(AtomicOrdering::Relaxed).as_ref()
             };
             while let Some(curr) = curr_opt {
-                match self.comparison.cmp(&curr.element, key) {
+                match self.comparison.cmp(&curr.kv.0, key) {
                     Ordering::Less => {
                         pred = &curr.inner;
                         curr_opt = unsafe { curr.inner[level].load(AtomicOrdering::Relaxed).as_ref() };
@@ -569,20 +577,23 @@ mod tests {
     #[test]
     fn smoke_test() {
         let skiplist = SkipList::new();
-        skiplist.insert(2);
-        skiplist.insert(1);
+        skiplist.insert(2, "blue".to_string());
+        skiplist.insert(1, "red".to_string());
         assert_eq!(skiplist.len(), 2);
 
         assert!(skiplist.contains(&1));
-        assert_eq!(*skiplist.get(&1).unwrap(), 1);
+        assert_eq!(skiplist.get(&1).unwrap().key(), &1);
+        assert_eq!(skiplist.get(&1).unwrap().value(), "red");
         assert!(skiplist.contains(&2));
+        assert_eq!(skiplist.get(&2).unwrap().value(), "blue");
         assert!(!skiplist.contains(&3));
 
         skiplist.remove(&1);
         assert!(!skiplist.contains(&1));
         assert_eq!(skiplist.len(), 1);
 
-        skiplist.insert(4);
+        skiplist.insert(4, "yellow".to_string());
+        assert_eq!(skiplist.get(&4).unwrap().value(), "yellow");
         assert_eq!(skiplist.len(), 2);
 
         assert!(!skiplist.contains(&1));
@@ -595,76 +606,40 @@ mod tests {
     fn reference_test() {
         // Do a bunch of random inserts/deletes on a SkipList and a BTree map
         // and make sure the map iterators compare equal at each step
-        use std::collections::BTreeSet;
+        use std::collections::BTreeMap;
         let skiplist = SkipList::new();
-        let mut btree = BTreeSet::new();
+        let mut btree = BTreeMap::new();
         let mut rng = rand::rng();
         for _ in 0..1000 {
             let op: u8 = rng.random_range(0..3);
-            let val: i32 = rng.random_range(0..100);
+            let key: i32 = rng.random_range(0..100);
             match op {
                 0 => {
-                    skiplist.insert(val);
-                    btree.insert(val);
+                    let val: i32 = rng.random_range(0..100);
+                    skiplist.insert(key, val);
+                    btree.insert(key, val);
                 }
                 1 => {
-                    skiplist.remove(&val);
-                    btree.remove(&val);
+                    skiplist.remove(&key);
+                    btree.remove(&key);
                 }
                 2 => {
-                    let contains_skiplist = skiplist.contains(&val);
-                    let contains_btree = btree.contains(&val);
-                    assert_eq!(contains_skiplist, contains_btree);
+                    let a = skiplist.get(&key);
+                    let b = btree.get(&key);
+                    assert_eq!(a.map(|r| *r.value()), b.cloned());
                 }
                 _ => unreachable!(),
             }
 
-            let skiplist_elems: Vec<i32> = skiplist.iter().map(|r| *r).collect();
-            let btree_elems: Vec<i32> = btree.iter().cloned().collect();
+            let skiplist_elems: Vec<(i32, i32)> = skiplist.iter()
+                .map(|r| (*r.key(), *r.value()))
+                .collect();
+            let btree_elems: Vec<(i32, i32)> = btree.iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
             assert_eq!(skiplist_elems, btree_elems);
             assert_eq!(skiplist.len(), skiplist_elems.len());
         }
-    }
-
-    // TODO: Implement SkipListMap and test properly
-    #[test]
-    fn test_insert_overwrite() {
-        #[derive(Debug)]
-        struct Pair(i32, i32);
-
-        impl PartialEq for Pair {
-            fn eq(&self, other: &Self) -> bool {
-                self.0 == other.0
-            }
-        }
-
-        impl Eq for Pair {}
-
-        impl Ord for Pair {
-            fn cmp(&self, other: &Self) -> Ordering {
-                Ord::cmp(&self.0, &other.0)
-            }
-        }
-
-        impl PartialOrd for Pair {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        impl std::borrow::Borrow<i32> for Pair {
-            fn borrow(&self) -> &i32 {
-                &self.0
-            }
-        }
-
-        // Test that insert() overwrites the existing element when it compares
-        // equal to the new element
-        let skiplist = SkipList::new();
-        skiplist.insert(Pair(1, 10));
-        assert_eq!(skiplist.get(&1).unwrap().1, 10);
-        skiplist.insert(Pair(1, 20));
-        assert_eq!(skiplist.get(&1).unwrap().1, 20);
     }
 
     #[test]
@@ -683,7 +658,7 @@ mod tests {
                 barrier.wait();
                 let start = i * n_items;
                 for j in 0..n_items {
-                    skiplist.insert(start + j);
+                    skiplist.insert(start + j, start + j);
                 }
             }));
         }
@@ -694,7 +669,7 @@ mod tests {
 
         assert_eq!(skiplist.len(), n_threads * n_items);
         for i in 0..n_threads * n_items {
-            assert!(skiplist.contains(&i), "Missing key {}", i);
+            assert_eq!(*skiplist.get(&i).unwrap().value(), i, "wrong value {}", i);
         }
     }
 
@@ -715,7 +690,7 @@ mod tests {
                 for _ in 0..n_ops {
                     let key = rng.random_range(0..100);
                     if rng.random_bool(0.5) {
-                        skiplist.insert(key);
+                        skiplist.insert(key, ());
                     } else {
                         skiplist.remove(&key);
                     }
@@ -727,7 +702,7 @@ mod tests {
             handle.join().unwrap();
         }
 
-        let elems: Vec<u32> = skiplist.iter().map(|r| *r).collect();
+        let elems: Vec<u32> = skiplist.iter().map(|r| *r.key()).collect();
         // Elems has the correct len
         assert_eq!(skiplist.len(), elems.len());
         // Elems is ordered
